@@ -11,12 +11,16 @@ from PyPDF2 import PdfReader
 
 
 # Загрузка модели
-try:
-    model = SentenceTransformer("all-MiniLM-L6-v2")
-except Exception as e:
-    print(f"[ОШИБКА] Не удалось загрузить модель SentenceTransformer: {e}", file=sys.stderr)
-    sys.exit(1)
-
+model = None
+def get_model():
+    global model
+    if model is None:
+        try:
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+        except Exception as e:
+            print(f"[ОШИБКА] Не удалось загрузить модель SentenceTransformer: {e}", file=sys.stderr)
+            sys.exit(1)
+    return model
 
 def read_document(filepath: str) -> str:
     """Считывание текста из txt, pdf, docx."""
@@ -56,6 +60,14 @@ def read_document(filepath: str) -> str:
     except Exception as e:
         raise RuntimeError(f"Ошибка при чтении файла '{filepath}': {e}")
 
+def chunk_text(text: str, max_tokens: int = 500) -> list:
+    """Разбивает текст на части (для обработки больших файлов)."""
+    words = text.split()
+    chunks = []
+    for i in range(0, len(words), max_tokens):
+        chunk = " ".join(words[i:i + max_tokens])
+        chunks.append(chunk)
+    return chunks
 
 def encode_and_save(filepath: str):
     """ Кодирует документ и сохраняет результат в файл. """
@@ -72,8 +84,21 @@ def encode_and_save(filepath: str):
     out = f"{root}_emb.npy"
 
     try:
+        model = get_model()
+        chunks = chunk_text(text)
+
+        embeddings = []
         with torch.no_grad():
-            embedding = model.encode(text, convert_to_numpy=True, normalize_embeddings=True)
+            for chunk in chunks:
+                emb = model.encode(chunk, convert_to_numpy=True, normalize_embeddings=True)
+                embeddings.append(emb) 
+
+        # Средний эмбединг
+        embedding = np.mean(embeddings, axis=0)
+
+        if np.isnan(embedding).any():
+            raise ValueError("Эмбеддинг содержит NaN")
+
         np.save(out, embedding)
         print(f"Эмбеддинг сохранён в {out}")
     except Exception as e:
