@@ -1,12 +1,11 @@
 import argparse
-import random
 import re
 import csv
-from typing import List, Dict
+from typing import Dict, List, Tuple
 
-import spacy
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+
+QG_MODEL_ID = "google/flan-t5-large"
+QA_MODEL_ID = "distilbert-base-uncased-distilled-squad"
 
 
 def preprocess_text(text: str) -> str:
@@ -19,75 +18,80 @@ def preprocess_text(text: str) -> str:
 def split_text_into_sentences(text: str) -> List[str]:
     """Сегментация текста на предложения с использованием SpaCy и Sentencizer."""
     text = preprocess_text(text)
-    try:
-        nlp = spacy.load("en_core_web_sm")
-    except OSError:
-        raise OSError(
-            "Модель 'en_core_web_sm' не найдена. "
-            "Установите её: python -m spacy download en_core_web_sm"
-        )
+    if not text:
+        return []
 
+    import spacy
+
+    nlp = spacy.blank("en")
     if "sentencizer" not in nlp.pipe_names:
         nlp.add_pipe("sentencizer")
 
     doc = nlp(text)
     sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
-    random.shuffle(sentences)
     return sentences
+
+
+def load_pipelines() -> Tuple[object, object]:
+    """Загружает пайплайны генерации вопросов и поиска ответов."""
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+
+    device = 0 if torch.cuda.is_available() else -1
+
+    tokenizer = AutoTokenizer.from_pretrained(QG_MODEL_ID)
+    model_kwargs = {}
+    if torch.cuda.is_available():
+        model_kwargs["torch_dtype"] = torch.float16
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(QG_MODEL_ID, **model_kwargs)
+
+    qg_pipeline = pipeline(
+        "text2text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        device=device
+    )
+
+    qa_pipeline = pipeline(
+        "question-answering",
+        model=QA_MODEL_ID,
+        device=device
+    )
+
+    return qg_pipeline, qa_pipeline
 
 
 def generate_QandA(topic: str, num_questions: int = 3, max_tokens: int = 256) -> List[Dict[str, str]]:
     """Генерация вопросов и ответов по теме"""
     if num_questions < 1 or max_tokens < 1:
         raise ValueError("num_questions и max_tokens должны быть >= 1")
-
-    device = 0 if torch.cuda.is_available() else -1
+    topic = preprocess_text(topic)
+    if not topic:
+        raise ValueError("Тема не должна быть пустой.")
 
     try:
-        model_id = "google/flan-t5-large"
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            model_id,
-            device_map="auto",
-            dtype=torch.bfloat16
-        )
-
-        qg_pipeline = pipeline(
-            "text2text-generation",
-            model=model,
-            tokenizer=tokenizer
-        )
-
-        qa_pipeline = pipeline(
-            "question-answering",
-            model="distilbert-base-uncased-distilled-squad",
-            device=device
-        )
-
+        qg_pipeline, qa_pipeline = load_pipelines()
     except Exception as e:
         raise RuntimeError(f"Ошибка при загрузке модели или пайплайнов: {e}")
 
-    # Разбиваем тему на "предложения" (можно просто использовать саму тему)
     sentences = split_text_into_sentences(topic)
     if not sentences:
         sentences = [topic]
 
     results = []
-    i = 0
-    while i < len(sentences) and len(results) < num_questions:
-        sent = sentences[i].strip()
+    attempts = 0
+    while len(results) < num_questions and attempts < num_questions * 3:
+        sent = sentences[attempts % len(sentences)].strip()
+        attempts += 1
         if not sent:
-            i += 1
             continue
 
-        # Объединяем короткие предложения
-        if len(sent.split()) < 10 and i + 1 < len(sentences):
-            sent = sent + " " + sentences[i + 1].strip()
-            i += 1
-        i += 1
-
         try:
-            prompt = f"Read the text and generate one question.\nText: {sent}"
+            prompt = (
+                "Generate one clear question about the topic and make it answerable from the context.\n"
+                f"Topic/context: {sent}"
+            )
             output = qg_pipeline(
                 prompt,
                 max_new_tokens=max_tokens,
@@ -109,6 +113,9 @@ def generate_QandA(topic: str, num_questions: int = 3, max_tokens: int = 256) ->
 
         except Exception as e:
             print(f"Ошибка при генерации QA для предложения: {sent}\n{e}")
+
+    if not results:
+        raise RuntimeError("Не удалось сгенерировать ни одной пары вопрос-ответ.")
 
     return results
 
@@ -141,6 +148,7 @@ def main():
         write_csv(results, args.output_file)
     except Exception as e:
         print(f"Ошибка при выполнении программы: {e}")
+        raise SystemExit(1) from e
 
 
 if __name__ == "__main__":

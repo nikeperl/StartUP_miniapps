@@ -1,12 +1,11 @@
 import argparse
 import os
-import random
 import re
-from typing import List, Dict
+from typing import Dict, List, Tuple
 
-import spacy
-import torch
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+
+QG_MODEL_ID = "google/flan-t5-large"
+QA_MODEL_ID = "distilbert-base-uncased-distilled-squad"
 
 
 def read_text_file(file_path: str) -> str:
@@ -45,22 +44,49 @@ def preprocess_text(text: str) -> str:
 def split_text_into_sentences(text: str) -> List[str]:
     """Сегментация текста на предложения с использованием SpaCy и Sentencizer."""
     text = preprocess_text(text)
-    try:
-        nlp = spacy.load("en_core_web_sm")
-    except OSError:
-        raise OSError(
-            "Модель 'en_core_web_sm' не найдена. "
-            "Установите её: python -m spacy download en_core_web_sm"
-        )
+    if not text:
+        return []
 
+    import spacy
+
+    nlp = spacy.blank("en")
     if "sentencizer" not in nlp.pipe_names:
         nlp.add_pipe("sentencizer")
 
     doc = nlp(text)
     sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
-    random.shuffle(sentences)
 
     return sentences
+
+
+def load_pipelines() -> Tuple[object, object]:
+    """Загружает пайплайны генерации вопросов и поиска ответов."""
+    import torch
+    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
+
+    device = 0 if torch.cuda.is_available() else -1
+
+    tokenizer = AutoTokenizer.from_pretrained(QG_MODEL_ID)
+    model_kwargs = {}
+    if torch.cuda.is_available():
+        model_kwargs["torch_dtype"] = torch.float16
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(QG_MODEL_ID, **model_kwargs)
+
+    qg_pipeline = pipeline(
+        "text2text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        device=device
+    )
+
+    qa_pipeline = pipeline(
+        "question-answering",
+        model=QA_MODEL_ID,
+        device=device
+    )
+
+    return qg_pipeline, qa_pipeline
 
 
 def generate_QandA(text: str, num_questions: int = 3, max_tokens: int = 256) -> List[Dict[str, str]]:
@@ -68,33 +94,15 @@ def generate_QandA(text: str, num_questions: int = 3, max_tokens: int = 256) -> 
     if num_questions < 1 or max_tokens < 1:
         raise ValueError("num_questions и max_tokens должны быть >= 1")
 
-    device = 0 if torch.cuda.is_available() else -1
-
     try:
-        model_id = "google/flan-t5-large"
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            model_id,
-            device_map="auto",
-            dtype=torch.bfloat16
-        )
-
-        qg_pipeline = pipeline(
-            "text2text-generation",
-            model=model,
-            tokenizer=tokenizer
-        )
-
-        qa_pipeline = pipeline(
-            "question-answering",
-            model="distilbert-base-uncased-distilled-squad",
-            device=device
-        )
-
+        qg_pipeline, qa_pipeline = load_pipelines()
     except Exception as e:
         raise RuntimeError(f"Ошибка при загрузке модели или пайплайнов: {e}")
 
     sentences = split_text_into_sentences(text)
+    if not sentences:
+        raise ValueError("После обработки текста не найдено предложений.")
+
     results = []
 
     i = 0
@@ -135,6 +143,9 @@ def generate_QandA(text: str, num_questions: int = 3, max_tokens: int = 256) -> 
         except Exception as e:
             print(f"Ошибка при генерации QA для предложения: {sent}\n{e}")
 
+    if not results:
+        raise RuntimeError("Не удалось сгенерировать ни одной пары вопрос-ответ.")
+
     return results
 
 
@@ -159,6 +170,7 @@ def main():
 
     except Exception as e:
         print(f"Ошибка при выполнении программы: {e}")
+        raise SystemExit(1) from e
 
 
 if __name__ == "__main__":

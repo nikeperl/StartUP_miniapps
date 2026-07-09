@@ -1,13 +1,6 @@
-from sentence_transformers import SentenceTransformer
-import torch
-import numpy as np
 import argparse
 import os
 import sys
-
-# Для чтения разных форматов
-import docx2txt
-from PyPDF2 import PdfReader
 
 
 # Загрузка модели
@@ -16,6 +9,8 @@ def get_model():
     global model
     if model is None:
         try:
+            from sentence_transformers import SentenceTransformer
+
             model = SentenceTransformer("all-MiniLM-L6-v2")
         except Exception as e:
             print(f"[ОШИБКА] Не удалось загрузить модель SentenceTransformer: {e}", file=sys.stderr)
@@ -38,6 +33,8 @@ def read_document(filepath: str) -> str:
         elif ext == ".pdf":
             text = []
             try:
+                from PyPDF2 import PdfReader
+
                 with open(filepath, "rb") as f:
                     reader = PdfReader(f)
                     for page in reader.pages:
@@ -49,6 +46,8 @@ def read_document(filepath: str) -> str:
             return "\n".join(text)
 
         elif ext == ".docx":
+            import docx2txt
+
             text = docx2txt.process(filepath)
             if text is None:
                 text = ""
@@ -62,6 +61,9 @@ def read_document(filepath: str) -> str:
 
 def chunk_text(text: str, max_tokens: int = 500) -> list:
     """Разбивает текст на части (для обработки больших файлов)."""
+    if max_tokens < 1:
+        raise ValueError("max_tokens должен быть >= 1")
+
     words = text.split()
     chunks = []
     for i in range(0, len(words), max_tokens):
@@ -78,14 +80,20 @@ def encode_and_save(filepath: str):
         return
 
     if not text.strip():
-        print(f"[ПРЕДУПРЕЖДЕНИЕ] Файл '{filepath}' пустой. Эмбеддинг может быть бесполезным.", file=sys.stderr)
+        print(f"[ОШИБКА] Файл '{filepath}' пустой или текст не удалось извлечь.", file=sys.stderr)
+        return
 
     root, _ = os.path.splitext(filepath)
     out = f"{root}_emb.npy"
 
     try:
+        import numpy as np
+        import torch
+
         model = get_model()
         chunks = chunk_text(text)
+        if not chunks:
+            raise ValueError("Нет текста для построения эмбеддинга")
 
         embeddings = []
         with torch.no_grad():
@@ -107,6 +115,8 @@ def encode_and_save(filepath: str):
 
 def cosine_similarity(file1: str, file2: str) -> float:
     """Считает косинусное сходство между эмбеддингами из двух файлов."""
+    import numpy as np
+
     for f in (file1, file2):
         if not os.path.isfile(f):
             raise FileNotFoundError(f"Файл '{f}' не найден.")
@@ -119,9 +129,14 @@ def cosine_similarity(file1: str, file2: str) -> float:
 
     if emb1.size == 0 or emb2.size == 0:
         raise ValueError("Один из эмбеддингов пустой.")
+    if emb1.shape != emb2.shape:
+        raise ValueError(f"Размеры эмбеддингов не совпадают: {emb1.shape} и {emb2.shape}.")
 
     try:
-        similarity = np.dot(emb1, emb2) / (np.linalg.norm(emb1) * np.linalg.norm(emb2))
+        denominator = np.linalg.norm(emb1) * np.linalg.norm(emb2)
+        if denominator == 0:
+            raise ValueError("Невозможно вычислить сходство для нулевого вектора.")
+        similarity = np.dot(emb1, emb2) / denominator
         return float(similarity)
     except Exception as e:
         raise RuntimeError(f"Ошибка при вычислении косинусного сходства: {e}")
